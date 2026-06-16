@@ -13,14 +13,16 @@ ASSUME N = 3 * F + 1
 
 Replicas == 0..(N-1)
 SeqNums == 1..MaxSeq
-PrimaryStates == {"init", "working", "done"}
-ReplicaStates == {"init", "pre-prepared", "prepared", "done"}
 
 VARIABLES 
     pState, \* The state of the primary
     rState, \* The state of the replica
     msgs \* The set of messages in the system
 
+\* May need a different digest as if there are multiple clinets, the timestamp night be the same :/
+\* It might be necessary to change the timestamp from a simple constant set into a variable that get's assigned
+\* an incremented value because I think now the timestamps can be random and not ordered
+\* also same timestamp can be used which causes an issue
 
 RequestMsg == [type: {"REQUEST"}, o: Ops, t: Timestamps, c: Clients]
 PrePrepareMsg == [type: {"PRE-PREPARE"}, v: Views, n: SeqNums, d: Timestamps, m: RequestMsg, p: Replicas]
@@ -32,59 +34,91 @@ Messages == RequestMsg \cup PrePrepareMsg \cup PrepareMsg \cup CommitMsg \cup Re
 
 Digest(m) == m.t
 
+PrimaryOf(v) == v % N
+
+IsReplica(i, v) == i # PrimaryOf(v)
+
 PBTypeOK ==
-    /\ pState \in [v: Views, primary: Replicas, nextN: 1..(MaxSeq+1), state: PrimaryStates]
-    /\ rState \in [Replicas -> [v: Views, h: Nat, H: Nat, log: SUBSET Messages, state: ReplicaStates]]
+    /\ pState \in [v: Views, nextN: 1..(MaxSeq+1)]
+    /\ rState \in [Replicas -> [v: Views,
+                                h: Nat,
+                                H: Nat,
+                                log: SUBSET Messages,
+                                lastExec: 0..MaxSeq]]
     /\ msgs \subseteq Messages
 
 PBInit ==
     /\ msgs = {}
-    /\ pState = [v |-> CHOOSE v \in Views: TRUE, primary |-> 0, nextN |-> 1, state |-> "init"]
+    /\ pState = [v |-> CHOOSE v \in Views: TRUE,
+                 nextN |-> 1]
     /\ rState = [i \in Replicas |-> [v |-> pState.v,
                                      h |-> 0, 
                                      H |-> MaxSeq + 1, 
                                      log |-> {},
-                                     state |-> "init"]]
+                                     lastExec |-> 0]]
 
+ClientAccepts(c, t, r) ==
+  \E S \in SUBSET Replicas:
+    /\ Cardinality(S) >= F + 1
+    /\ \A i \in S:
+          \E reply \in msgs:
+            /\ reply.type = "REPLY"
+            /\ reply.c = c
+            /\ reply.t = t
+            /\ reply.r = r
+            /\ reply.i = i
+
+ClientHasOutstandingRequest(c) ==
+  \E m \in msgs:
+    /\ m.type = "REQUEST"
+    /\ m.c = c
+    /\ ~ClientAccepts(m.c, m.t, m.o)
+
+RequestAlreadyAssigned(m) ==
+  \E pp \in msgs:
+    /\ pp.type = "PRE-PREPARE"
+    /\ pp.m.c = m.c
+    /\ pp.m.t = m.t
 
 ClientRequest(c, o, t) ==
     /\ c \in Clients
     /\ o \in Ops
     /\ t \in Timestamps
+    /\ ~ClientHasOutstandingRequest(c)
     /\ LET req == [type |-> "REQUEST", o |-> o, t |-> t, c |-> c] IN
        msgs' = msgs \cup {req}
     /\ UNCHANGED <<pState, rState>>
 
-
+\* PrimaryPrePrepareFor(m) maybe parameterize this?
 PrimaryPrePrepare ==
     \E m \in msgs:
         /\ m.type = "REQUEST"
         /\ pState.nextN \in SeqNums
+        /\ ~RequestAlreadyAssigned(m)
         /\ LET v == pState.v
                n == pState.nextN
                d == Digest(m)
                prePrepareMsg == [type |-> "PRE-PREPARE",
-                                    v |-> v,
-                                    n |-> n,
-                                    d |-> d,
-                                    m |-> m,
-                                    p |-> pState.primary]
+                                 v |-> v,
+                                 n |-> n,
+                                 d |-> d,
+                                 m |-> m,
+                                 p |-> PrimaryOf(v)]
             IN
                 /\ msgs' = msgs \cup {prePrepareMsg}
-                /\ pState' = [pState EXCEPT !.nextN = n + 1,
-                                             !.state = IF n = MaxSeq THEN "done" ELSE "working"]
+                /\ pState' = [pState EXCEPT !.nextN = n + 1]
                 /\ UNCHANGED rState
 
 ReplicaRcvPrePrepare(i) ==
   \E m \in msgs:
     /\ m.type = "PRE-PREPARE"
+    /\ m.p = PrimaryOf(m.v)
     /\ rState[i].v = m.v
     /\ rState[i].h < m.n
     /\ m.n < rState[i].H
     /\ \A pp2 \in rState[i].log:
          ~(pp2.type = "PRE-PREPARE" /\ pp2.v = m.v /\ pp2.n = m.n /\ pp2.d # m.d)
-    /\ rState' = [rState EXCEPT ![i].log = @ \cup {m},
-                                ![i].state = IF @ = "done" THEN "done" ELSE "pre-prepared"]
+    /\ rState' = [rState EXCEPT ![i].log = rState[i].log \cup {m}]
     /\ UNCHANGED <<msgs, pState>>
 
 
@@ -92,6 +126,7 @@ ReplicaSendPrepare(i) ==
   \E m \in rState[i].log:
     /\ m.type = "PRE-PREPARE"
     /\ rState[i].v = m.v
+    /\ IsReplica(i, m.v)
     /\ LET prepareMsg == [type |-> "PREPARE",
                           v |-> m.v,
                           n |-> m.n,
@@ -100,8 +135,7 @@ ReplicaSendPrepare(i) ==
        IN
           /\ prepareMsg \notin msgs
           /\ msgs' = msgs \cup {prepareMsg}
-          /\ rState' = [rState EXCEPT ![i].log = @ \cup {prepareMsg},
-                                      ![i].state = IF @ = "done" THEN "done" ELSE "pre-prepared"]
+          /\ rState' = [rState EXCEPT ![i].log = rState[i].log \cup {prepareMsg}]
           /\ UNCHANGED pState
 
 ReplicaRcvPrepare(i) ==
@@ -111,7 +145,7 @@ ReplicaRcvPrepare(i) ==
     /\ rState[i].h < m.n
     /\ m.n < rState[i].H
     /\ m \notin rState[i].log
-    /\ rState' = [rState EXCEPT ![i].log = @ \cup {m}]
+    /\ rState' = [rState EXCEPT ![i].log = rState[i].log \cup {m}]
     /\ UNCHANGED <<msgs, pState>>
 
 Prepared(i, v, n, d) ==
@@ -124,7 +158,8 @@ Prepared(i, v, n, d) ==
         /\ p.type = "PREPARE"
         /\ p.v = v
         /\ p.n = n
-        /\ p.d = d}) >= 2 * F
+        /\ p.d = d
+        /\ IsReplica(p.i, v)}) >= 2 * F
 
 
 ReplicaSendCommit(i) ==
@@ -140,7 +175,7 @@ ReplicaSendCommit(i) ==
        IN
           /\ commitMsg \notin msgs
           /\ msgs' = msgs \cup {commitMsg}
-          /\ rState' = [rState EXCEPT ![i].state = IF @ = "done" THEN "done" ELSE "prepared"]
+          /\ rState' = [rState EXCEPT ![i].log = rState[i].log \cup {commitMsg}]
           /\ UNCHANGED pState
 
 ReplicaRcvCommit(i) ==
@@ -150,7 +185,7 @@ ReplicaRcvCommit(i) ==
     /\ rState[i].h < m.n
     /\ m.n < rState[i].H
     /\ m \notin rState[i].log
-    /\ rState' = [rState EXCEPT ![i].log = @ \cup {m}]
+    /\ rState' = [rState EXCEPT ![i].log = rState[i].log \cup {m}]
     /\ UNCHANGED <<msgs, pState>>
 
 CommittedLocal(i, v, n, d) ==
@@ -165,6 +200,7 @@ CommittedLocal(i, v, n, d) ==
 ReplicaSendReply(i) ==
   \E pp \in rState[i].log:
     /\ pp.type = "PRE-PREPARE"
+    /\ pp.n = rState[i].lastExec + 1
     /\ CommittedLocal(i, pp.v, pp.n, pp.d)
     /\ LET replyMsg == [type |-> "REPLY",
                         v |-> pp.v,
@@ -175,19 +211,10 @@ ReplicaSendReply(i) ==
        IN
           /\ replyMsg \notin msgs
           /\ msgs' = msgs \cup {replyMsg}
-          /\ rState' = [rState EXCEPT ![i].state = "done"]
+          /\ rState' = [rState EXCEPT ![i].lastExec = pp.n]
           /\ UNCHANGED pState
 
-ClientAccepts(c, t, r) ==
-  \E S \in SUBSET Replicas:
-    /\ Cardinality(S) >= F + 1
-    /\ \A i \in S:
-          \E reply \in msgs:
-            /\ reply.type = "REPLY"
-            /\ reply.c = c
-            /\ reply.t = t
-            /\ reply.r = r
-            /\ reply.i = i
+
 
 
 PBNext ==
@@ -228,11 +255,12 @@ PBSpec ==
        /\ WF_vars(ReplicaRcvCommit(i))
        /\ WF_vars(ReplicaSendReply(i))
 
-
-\* I think we still have to model if a non primary recevies request. In that case, 
-\* the request needs to be sent to primary from the replica
-\* + we don't check for signature I don't know if we should tho
-\* The committed systemwide predicate described in the model is not modeled but I don't know where it would fit exactly
-\* How do you wanna model actions being executed, or is sending a reply enough for modeling this
+NoConflictingPrePrepare ==
+  \A pp1, pp2 \in msgs:
+    /\ pp1.type = "PRE-PREPARE"
+    /\ pp2.type = "PRE-PREPARE"
+    /\ pp1.v = pp2.v
+    /\ pp1.n = pp2.n
+    => pp1.m = pp2.m
 
 ====
