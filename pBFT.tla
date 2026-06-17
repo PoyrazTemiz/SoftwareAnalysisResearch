@@ -8,11 +8,14 @@ CONSTANT Ops
 CONSTANT Timestamps
 CONSTANT Views
 CONSTANT MaxSeq
+CONSTANT StateDigests
+CONSTANT WindowSize
 
 ASSUME N = 3 * F + 1
 
 Replicas == 0..(N-1)
 SeqNums == 1..MaxSeq
+CheckpointNums == 0..MaxSeq
 
 VARIABLES 
     pState, \* The state of the primary
@@ -29,8 +32,22 @@ PrePrepareMsg == [type: {"PRE-PREPARE"}, v: Views, n: SeqNums, d: Timestamps, m:
 PrepareMsg == [type: {"PREPARE"}, v: Views, n: SeqNums, d: Timestamps, i: Replicas]
 CommitMsg == [type: {"COMMIT"}, v: Views, n: SeqNums, d: Timestamps, i: Replicas]
 ReplyMsg == [type: {"REPLY"}, v: Views, t: Timestamps, c: Clients, i: Replicas, r: Ops]
+CheckpointMsg == [type: {"CHECKPOINT"}, n: CheckpointNums, d: StateDigests, i: Replicas]
 
-Messages == RequestMsg \cup PrePrepareMsg \cup PrepareMsg \cup CommitMsg \cup ReplyMsg
+ProtocolMsg ==
+  PrePrepareMsg \cup PrepareMsg \cup CommitMsg
+
+ViewChangeMsg ==
+  [type: {"VIEW-CHANGE"},
+   v: Views,
+   i: Replicas,   
+   checkpointN: CheckpointNums,
+   checkpointD: StateDigests,
+   prepared: SUBSET ProtocolMsg]
+
+NewViewMsg == [type: {"NEW-VIEW"}, v: Views, i: Replicas, viewChanges: SUBSET ViewChangeMsg, prePrepares: SUBSET PrePrepareMsg]
+
+Messages == RequestMsg \cup PrePrepareMsg \cup PrepareMsg \cup CommitMsg \cup ReplyMsg \cup CheckpointMsg \cup ViewChangeMsg \cup NewViewMsg
 
 Digest(m) == m.t
 
@@ -214,8 +231,138 @@ ReplicaSendReply(i) ==
           /\ rState' = [rState EXCEPT ![i].lastExec = pp.n]
           /\ UNCHANGED pState
 
+IsCheckpointSeq(n) == n > 0
 
+StateDigest(i, n) == CHOOSE d \in StateDigests: TRUE
 
+MessageSeq(m) ==
+  IF m.type \in {"PRE-PREPARE", "PREPARE", "COMMIT", "CHECKPOINT"}
+  THEN m.n
+  ELSE 0
+
+StableCheckpoint(n, d) ==
+  Cardinality({cp \in msgs:
+    /\ cp.type = "CHECKPOINT"
+    /\ cp.n = n
+    /\ cp.d = d}) >= 2 * F + 1
+
+PreparedCertificate(i, v, n, d) ==
+  {m \in rState[i].log:
+    \/ /\ m.type = "PRE-PREPARE"
+       /\ m.v = v /\ m.n = n /\ m.d = d
+    \/ /\ m.type = "PREPARE"
+       /\ m.v = v /\ m.n = n /\ m.d = d}
+
+PreparedCertificates(i) ==
+  {m \in rState[i].log:
+    /\ m.type \in {"PRE-PREPARE", "PREPARE", "COMMIT"}
+    /\ m.n > rState[i].h}
+      
+ReplicaSendCheckpoint(i) ==
+  /\ IsCheckpointSeq(rState[i].lastExec)
+  /\ LET cp == [type |-> "CHECKPOINT",
+                n |-> rState[i].lastExec,
+                d |-> StateDigest(i, rState[i].lastExec),
+                i |-> i]
+     IN
+        /\ cp \notin msgs
+        /\ msgs' = msgs \cup {cp}
+        /\ UNCHANGED <<pState, rState>>
+
+ReplicaStabilizeCheckpoint(i) ==
+  \E n \in 0..MaxSeq:
+  \E d \in StateDigests:
+    /\ n > rState[i].h
+    /\ StableCheckpoint(n, d)
+    /\ rState' =
+         [rState EXCEPT
+            ![i].h = n,
+            ![i].H = n + WindowSize,
+            ![i].log = {m \in rState[i].log:
+                          MessageSeq(m) > n}]
+    /\ UNCHANGED <<msgs, pState>>
+
+ReplicaSendViewChange(i) ==
+  \E newV \in Views:
+    /\ newV = rState[i].v + 1
+    /\ LET vc == [type |-> "VIEW-CHANGE",
+                  v |-> newV,
+                  i |-> i,
+                  checkpointN |-> rState[i].h,
+                  checkpointD |-> StateDigest(i, rState[i].h),
+                  prepared |-> PreparedCertificates(i)]
+       IN
+          /\ vc \notin msgs
+          /\ msgs' = msgs \cup {vc}
+          /\ UNCHANGED <<pState, rState>>
+
+ViewChangeQuorum(v, VCs) ==
+  /\ VCs \subseteq msgs
+  /\ Cardinality(VCs) >= 2 * F + 1
+  /\ \A vc \in VCs:
+       /\ vc.type = "VIEW-CHANGE"
+       /\ vc.v = v
+
+NewViewCheckpointN(nv) ==
+  CHOOSE n \in 0..MaxSeq:
+    \E vc \in nv.viewChanges:
+      vc.checkpointN = n
+
+NewViewIsSafe(nv) ==
+  /\ ViewChangeQuorum(nv.v, nv.viewChanges)
+  /\ \A pp \in nv.prePrepares:
+       /\ pp.v = nv.v
+       /\ pp.n > NewViewCheckpointN(nv)
+
+SafePrePrepares(v, VCs) ==
+  UNION {
+    { [type |-> "PRE-PREPARE",
+       v |-> v,
+       n |-> pp.n,
+       d |-> pp.d,
+       m |-> pp.m,
+       p |-> PrimaryOf(v)] :
+        pp \in {x \in vc.prepared :
+                  /\ x.type = "PRE-PREPARE"
+                  /\ x.n > vc.checkpointN} }
+    : vc \in VCs
+  }
+
+NextPrimarySeq(nv) ==
+  CHOOSE n \in 1..(MaxSeq + 1):
+    /\ n > NewViewCheckpointN(nv)
+    /\ \A pp \in nv.prePrepares: pp.n < n
+    /\ \/ n = NewViewCheckpointN(nv) + 1
+       \/ \E pp \in nv.prePrepares: pp.n = n - 1
+
+PrimarySendNewView ==
+  \E v \in Views:
+  \E VCs \in SUBSET msgs:
+    /\ ViewChangeQuorum(v, VCs)
+    /\ LET nv == [type |-> "NEW-VIEW",
+                  v |-> v,
+                  i |-> PrimaryOf(v),
+                  viewChanges |-> VCs,
+                  prePrepares |-> SafePrePrepares(v, VCs)]
+       IN
+          /\ nv \notin msgs
+          /\ msgs' = msgs \cup {nv}
+          /\ pState' = [v |-> v, nextN |-> NextPrimarySeq(nv)]
+          /\ UNCHANGED rState
+
+ReplicaRcvNewView(i) ==
+  \E nv \in msgs:
+    /\ nv.type = "NEW-VIEW"
+    /\ nv.v > rState[i].v
+    /\ nv.i = PrimaryOf(nv.v)
+    /\ NewViewIsSafe(nv)
+    /\ rState' =
+         [rState EXCEPT
+            ![i].v = nv.v,
+            ![i].h = NewViewCheckpointN(nv),
+            ![i].H = NewViewCheckpointN(nv) + WindowSize,
+            ![i].log = rState[i].log \cup nv.prePrepares]
+    /\ UNCHANGED <<msgs, pState>>
 
 PBNext ==
   \/ \E c \in Clients, o \in Ops, t \in Timestamps:
@@ -233,6 +380,16 @@ PBNext ==
         ReplicaRcvCommit(i)
   \/ \E i \in Replicas:
         ReplicaSendReply(i)
+  \/ \E i \in Replicas:
+        ReplicaSendCheckpoint(i)
+  \/ \E i \in Replicas:
+        ReplicaStabilizeCheckpoint(i)
+  \/ \E i \in Replicas:
+        ReplicaSendViewChange(i)
+  \/ PrimarySendNewView
+  \/ \E i \in Replicas:
+        ReplicaRcvNewView(i)
+
 
 RequestSent(c, o, t) ==
   [type |-> "REQUEST", o |-> o, t |-> t, c |-> c] \in msgs
@@ -254,6 +411,9 @@ PBSpec ==
        /\ WF_vars(ReplicaSendCommit(i))
        /\ WF_vars(ReplicaRcvCommit(i))
        /\ WF_vars(ReplicaSendReply(i))
+       /\ WF_vars(ReplicaSendCheckpoint(i))
+       /\ WF_vars(ReplicaStabilizeCheckpoint(i))
+       /\ WF_vars(ReplicaRcvNewView(i))
 
 NoConflictingPrePrepare ==
   \A pp1, pp2 \in msgs:
@@ -262,5 +422,27 @@ NoConflictingPrePrepare ==
     /\ pp1.v = pp2.v
     /\ pp1.n = pp2.n
     => pp1.m = pp2.m
+
+NoConflictingStableCheckpoints ==
+  \A n \in 0..MaxSeq:
+  \A d1, d2 \in StateDigests:
+    /\ StableCheckpoint(n, d1)
+    /\ StableCheckpoint(n, d2)
+    => d1 = d2
+
+NoConflictingCommittedAcrossViews ==
+  \A i, j \in Replicas:
+  \A v1, v2 \in Views:
+  \A n \in SeqNums:
+  \A d1, d2 \in Timestamps:
+    /\ CommittedLocal(i, v1, n, d1)
+    /\ CommittedLocal(j, v2, n, d2)
+    => d1 = d2
+
+NewViewOnlyAboveCheckpoint ==
+  \A nv \in msgs:
+    nv.type = "NEW-VIEW" =>
+      \A pp \in nv.prePrepares:
+        pp.n > NewViewCheckpointN(nv)
 
 ====
