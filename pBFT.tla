@@ -11,7 +11,7 @@ CONSTANT MaxSeq
 CONSTANT StateDigests
 CONSTANT WindowSize
 
-ASSUME N = 3 * F + 1
+ASSUME N >= 3 * F + 1
 
 Replicas == 0..(N-1)
 SeqNums == 1..MaxSeq
@@ -21,11 +21,6 @@ VARIABLES
     pState, \* The state of the primary
     rState, \* The state of the replica
     msgs \* The set of messages in the system
-
-\* May need a different digest as if there are multiple clinets, the timestamp night be the same :/
-\* It might be necessary to change the timestamp from a simple constant set into a variable that get's assigned
-\* an incremented value because I think now the timestamps can be random and not ordered
-\* also same timestamp can be used which causes an issue
 
 RequestMsg == [type: {"REQUEST"}, o: Ops, t: Timestamps, c: Clients]
 PrePrepareMsg == [type: {"PRE-PREPARE"}, v: Views, n: SeqNums, d: Timestamps, m: RequestMsg, p: Replicas]
@@ -54,6 +49,25 @@ Digest(m) == m.t
 PrimaryOf(v) == v % N
 
 IsReplica(i, v) == i # PrimaryOf(v)
+
+TimestampAlreadyUsed(t) ==
+  \E m \in msgs:
+    /\ m.type = "REQUEST"
+    /\ m.t = t
+
+AllEarlierTimestampsUsed(t) ==
+  \A t2 \in Timestamps:
+    t2 < t => TimestampAlreadyUsed(t2)
+
+ViewChangesFor(v) ==
+  {m \in msgs:
+    /\ m.type = "VIEW-CHANGE"
+    /\ m.v = v}
+
+NewViewExists(v) ==
+  \E nv \in msgs:
+    /\ nv.type = "NEW-VIEW"
+    /\ nv.v = v
 
 PBTypeOK ==
     /\ pState \in [v: Views, nextN: 1..(MaxSeq+1)]
@@ -108,11 +122,12 @@ ClientRequest(c, o, t) ==
     /\ o \in Ops
     /\ t \in Timestamps
     /\ ~ClientHasOutstandingRequest(c)
+    /\ ~TimestampAlreadyUsed(t)
+    /\ AllEarlierTimestampsUsed(t)
     /\ LET req == [type |-> "REQUEST", o |-> o, t |-> t, c |-> c] IN
        msgs' = msgs \cup {req}
     /\ UNCHANGED <<pState, rState>>
 
-\* PrimaryPrePrepareFor(m) maybe parameterize this?
 PrimaryPrePrepare ==
     \E m \in msgs:
         /\ m.type = "REQUEST"
@@ -287,6 +302,7 @@ ReplicaStabilizeCheckpoint(i) ==
 ReplicaSendViewChange(i) ==
   \E newV \in Views:
     /\ newV = rState[i].v + 1
+    /\ ~NewViewExists(newV)
     /\ ReplicaWaiting(i)
     /\ LET vc == [type |-> "VIEW-CHANGE",
                   v |-> newV,
@@ -343,9 +359,10 @@ NextPrimarySeq(nv) ==
 
 PrimarySendNewView ==
   \E v \in Views:
-  \E VCs \in SUBSET msgs:
-    /\ ViewChangeQuorum(v, VCs)
-    /\ LET nv == [type |-> "NEW-VIEW",
+    /\ ~NewViewExists(v)
+    /\ Cardinality(ViewChangesFor(v)) >= 2 * F + 1
+    /\ LET VCs == ViewChangesFor(v)
+           nv == [type |-> "NEW-VIEW",
                   v |-> v,
                   i |-> PrimaryOf(v),
                   viewChanges |-> VCs,
