@@ -43,7 +43,7 @@ ViewChangeMsg ==
    i: Replicas,   
    checkpointN: CheckpointNums,
    checkpointD: StateDigests,
-   prepared: SUBSET ProtocolMsg]
+   prepared: SUBSET PrePrepareMsg]
 
 NewViewMsg == [type: {"NEW-VIEW"}, v: Views, i: Replicas, viewChanges: SUBSET ViewChangeMsg, prePrepares: SUBSET PrePrepareMsg]
 
@@ -85,15 +85,21 @@ ClientAccepts(c, t, r) ==
             /\ reply.r = r
             /\ reply.i = i
 
+ReplicaWaiting(i) ==
+  \E req \in msgs:
+    /\ req.type = "REQUEST"
+    /\ ~ClientAccepts(req.c, req.t, req.o)
+
 ClientHasOutstandingRequest(c) ==
   \E m \in msgs:
     /\ m.type = "REQUEST"
     /\ m.c = c
     /\ ~ClientAccepts(m.c, m.t, m.o)
 
-RequestAlreadyAssigned(m) ==
+RequestAlreadyAssignedInView(m, v) ==
   \E pp \in msgs:
     /\ pp.type = "PRE-PREPARE"
+    /\ pp.v = v
     /\ pp.m.c = m.c
     /\ pp.m.t = m.t
 
@@ -111,7 +117,7 @@ PrimaryPrePrepare ==
     \E m \in msgs:
         /\ m.type = "REQUEST"
         /\ pState.nextN \in SeqNums
-        /\ ~RequestAlreadyAssigned(m)
+        /\ ~RequestAlreadyAssignedInView(m, pState.v)
         /\ LET v == pState.v
                n == pState.nextN
                d == Digest(m)
@@ -246,17 +252,13 @@ StableCheckpoint(n, d) ==
     /\ cp.n = n
     /\ cp.d = d}) >= 2 * F + 1
 
-PreparedCertificate(i, v, n, d) ==
-  {m \in rState[i].log:
-    \/ /\ m.type = "PRE-PREPARE"
-       /\ m.v = v /\ m.n = n /\ m.d = d
-    \/ /\ m.type = "PREPARE"
-       /\ m.v = v /\ m.n = n /\ m.d = d}
+PrePreparesInLog(i) ==
+  {m \in rState[i].log: m.type = "PRE-PREPARE"}
 
-PreparedCertificates(i) ==
-  {m \in rState[i].log:
-    /\ m.type \in {"PRE-PREPARE", "PREPARE", "COMMIT"}
-    /\ m.n > rState[i].h}
+PreparedPrePrepares(i) ==
+  {pp \in PrePreparesInLog(i):
+    /\ pp.n > rState[i].h
+    /\ Prepared(i, pp.v, pp.n, pp.d)}
       
 ReplicaSendCheckpoint(i) ==
   /\ IsCheckpointSeq(rState[i].lastExec)
@@ -285,16 +287,18 @@ ReplicaStabilizeCheckpoint(i) ==
 ReplicaSendViewChange(i) ==
   \E newV \in Views:
     /\ newV = rState[i].v + 1
+    /\ ReplicaWaiting(i)
     /\ LET vc == [type |-> "VIEW-CHANGE",
                   v |-> newV,
                   i |-> i,
                   checkpointN |-> rState[i].h,
                   checkpointD |-> StateDigest(i, rState[i].h),
-                  prepared |-> PreparedCertificates(i)]
+                  prepared |-> PreparedPrePrepares(i)]
        IN
           /\ vc \notin msgs
           /\ msgs' = msgs \cup {vc}
-          /\ UNCHANGED <<pState, rState>>
+          /\ rState' = [rState EXCEPT ![i].v = newV]
+          /\ UNCHANGED pState
 
 ViewChangeQuorum(v, VCs) ==
   /\ VCs \subseteq msgs
@@ -304,9 +308,11 @@ ViewChangeQuorum(v, VCs) ==
        /\ vc.v = v
 
 NewViewCheckpointN(nv) ==
-  CHOOSE n \in 0..MaxSeq:
-    \E vc \in nv.viewChanges:
-      vc.checkpointN = n
+  CHOOSE n \in CheckpointNums:
+    /\ \E vc \in nv.viewChanges:
+         vc.checkpointN = n
+    /\ \A vc \in nv.viewChanges:
+         vc.checkpointN <= n
 
 NewViewIsSafe(nv) ==
   /\ ViewChangeQuorum(nv.v, nv.viewChanges)
@@ -353,7 +359,7 @@ PrimarySendNewView ==
 ReplicaRcvNewView(i) ==
   \E nv \in msgs:
     /\ nv.type = "NEW-VIEW"
-    /\ nv.v > rState[i].v
+    /\ nv.v >= rState[i].v
     /\ nv.i = PrimaryOf(nv.v)
     /\ NewViewIsSafe(nv)
     /\ rState' =
@@ -394,7 +400,7 @@ PBNext ==
 RequestSent(c, o, t) ==
   [type |-> "REQUEST", o |-> o, t |-> t, c |-> c] \in msgs
 
-GoodWeatherSuccess ==
+RequestSuccess ==
   \A c \in Clients, o \in Ops, t \in Timestamps:
     [](RequestSent(c, o, t) => <>ClientAccepts(c, t, o))
 
@@ -404,6 +410,7 @@ PBSpec ==
   PBInit
   /\ [][PBNext]_vars
   /\ WF_vars(PrimaryPrePrepare)
+  /\ WF_vars(PrimarySendNewView)
   /\ \A i \in Replicas:
        /\ WF_vars(ReplicaRcvPrePrepare(i))
        /\ WF_vars(ReplicaSendPrepare(i))
@@ -413,6 +420,7 @@ PBSpec ==
        /\ WF_vars(ReplicaSendReply(i))
        /\ WF_vars(ReplicaSendCheckpoint(i))
        /\ WF_vars(ReplicaStabilizeCheckpoint(i))
+       /\ WF_vars(ReplicaSendViewChange(i))
        /\ WF_vars(ReplicaRcvNewView(i))
 
 NoConflictingPrePrepare ==
