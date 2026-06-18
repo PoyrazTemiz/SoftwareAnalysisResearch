@@ -104,6 +104,10 @@ ReplicaWaiting(i) ==
     /\ req.type = "REQUEST"
     /\ ~ClientAccepts(req.c, req.t, req.o)
 
+CanStartViewChange(i) ==
+  /\ ReplicaWaiting(i)
+  /\ pState.nextN = MaxSeq + 1
+
 ClientHasOutstandingRequest(c) ==
   \E m \in msgs:
     /\ m.type = "REQUEST"
@@ -303,7 +307,7 @@ ReplicaSendViewChange(i) ==
   \E newV \in Views:
     /\ newV = rState[i].v + 1
     /\ ~NewViewExists(newV)
-    /\ ReplicaWaiting(i)
+    /\ CanStartViewChange(i)
     /\ LET vc == [type |-> "VIEW-CHANGE",
                   v |-> newV,
                   i |-> i,
