@@ -86,7 +86,8 @@ ClientRequest(c, o, t) ==
     /\ t \in Timestamps
     /\ ~ClientHasOutstandingRequest(c)
     /\ LET req == [type |-> "REQUEST", o |-> o, t |-> t, c |-> c] IN
-       msgs' = msgs \cup {req}
+       /\ req \notin msgs
+       /\ msgs' = msgs \cup {req}
     /\ UNCHANGED <<pState, rState>>
 
 \* PrimaryPrePrepareFor(m) maybe parameterize this?
@@ -113,6 +114,7 @@ ReplicaRcvPrePrepare(i) ==
   \E m \in msgs:
     /\ m.type = "PRE-PREPARE"
     /\ m.p = PrimaryOf(m.v)
+    /\ m \notin rState[i].log
     /\ rState[i].v = m.v
     /\ rState[i].h < m.n
     /\ m.n < rState[i].H
