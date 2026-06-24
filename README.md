@@ -1,1 +1,3 @@
-# SoftwareAnalysisResearch
+# PBFT model with TLA+
+
+To run this model with TLC, make sure to have the [TLA+ extension](https://marketplace.visualstudio.com/items?itemName=tlaplus.vscode-ide) installed in VS Code. After this is installed, open `pBFT.tla` and open the command pallete of VS code with `ctrl + shift + P`. Now look for the `TLA+: Check model with TLC`, click it and the extension will start checking the model with the config file that has the same name as the model.
